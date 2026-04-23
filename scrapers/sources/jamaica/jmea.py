@@ -46,9 +46,10 @@ class JmeaScraper(CompanyScraper):
     delay_seconds = 1.5  # site has ~600 detail pages; 3s each would blow the 3h CI timeout
 
     def fetch(self) -> Iterable[Company]:
-        total_pages = self._discover_page_count()
-        logger.info("JMEA pages to scrape: %d", total_pages)
-        for page in range(1, total_pages + 1):
+        # Walk pages forward until we hit one with no cards (or 404) rather than
+        # relying on a fragile pagination-count discovery selector that's
+        # occasionally missing depending on what upstream serves.
+        for page in range(1, MAX_PAGES + 1):
             url = LISTING_URL if page == 1 else PAGE_URL.format(page=page)
             try:
                 soup = self.soup(url)
@@ -57,6 +58,9 @@ class JmeaScraper(CompanyScraper):
                 continue
             cards = soup.select(SELECTORS["card"])
             logger.info("JMEA page %d: %d cards", page, len(cards))
+            if not cards:
+                logger.info("JMEA stopping at page %d (no cards)", page)
+                break
             for card in cards:
                 name_el = card.select_one(SELECTORS["name"])
                 if not name_el:
@@ -87,6 +91,7 @@ class JmeaScraper(CompanyScraper):
                 )
 
     def _discover_page_count(self) -> int:
+        """Kept for external callers; the main loop now walks until empty."""
         try:
             soup = self.soup(LISTING_URL)
         except requests.RequestException as e:
