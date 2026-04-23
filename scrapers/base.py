@@ -12,9 +12,14 @@ from .models import Company
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_USER_AGENT = "procur-prospects/0.1 (+contact cole@procur.app)"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 procur-prospects/0.1"
+)
 DEFAULT_DELAY_SECONDS = 3.0
-DEFAULT_TIMEOUT_SECONDS = 25
+DEFAULT_TIMEOUT_SECONDS = 60
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_RETRY_BACKOFF = 4.0
 
 
 class CompanyScraper(ABC):
@@ -32,18 +37,35 @@ class CompanyScraper(ABC):
 
     def __init__(self) -> None:
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
+        self.session.headers.update({
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
 
     @abstractmethod
     def fetch(self) -> Iterable[Company]:
         """Yield Company records from the source."""
 
     def get(self, url: str, **kwargs) -> requests.Response:
+        """GET with polite delay + exponential backoff on 5xx and timeouts."""
         time.sleep(self.delay_seconds)
         kwargs.setdefault("timeout", DEFAULT_TIMEOUT_SECONDS)
-        resp = self.session.get(url, **kwargs)
-        resp.raise_for_status()
-        return resp
+        last_exc: Exception | None = None
+        for attempt in range(DEFAULT_RETRY_ATTEMPTS):
+            try:
+                resp = self.session.get(url, **kwargs)
+                if resp.status_code >= 500:
+                    raise requests.HTTPError(f"{resp.status_code} server error", response=resp)
+                resp.raise_for_status()
+                return resp
+            except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
+                last_exc = e
+                wait = DEFAULT_RETRY_BACKOFF * (2 ** attempt)
+                logger.info("retry %d for %s (%s) in %.1fs", attempt + 1, url, e, wait)
+                time.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
 
     def soup(self, url: str, **kwargs) -> BeautifulSoup:
         return BeautifulSoup(self.get(url, **kwargs).text, "html.parser")

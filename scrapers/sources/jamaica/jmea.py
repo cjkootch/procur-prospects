@@ -1,29 +1,42 @@
 """Jamaica Manufacturers & Exporters Association member directory.
 
-Selector assumptions below are based on typical WordPress business-directory
-plugins. Run against the live site, inspect the HTML, and tighten SELECTORS
-if the output count is zero or fields come back empty.
+The public directory lives at https://jmea.org/listings/ — a paginated grid
+of cards (48 per page, currently 13 pages ≈ ~600 members).  Each card links
+to a detail page where the phone and email live inside a `<ul class="ul-disc">`
+list of "Phone : ..." / "Email : ..." bullet points.
 """
 from __future__ import annotations
 
+import logging
+import re
 from typing import Iterable
+
+import requests
 
 from ...base import CompanyScraper
 from ...models import Company
 from ...utils.normalize import clean_email, clean_phone, clean_website
 
-LISTING_URL = "https://jmea.org/member-directory/"
+logger = logging.getLogger(__name__)
+
+LISTING_URL = "https://jmea.org/listings/"
+PAGE_URL = "https://jmea.org/listings/page/{page}/"
+MAX_PAGES = 20  # safety cap; site currently has ~13
 
 SELECTORS = {
-    "card": ".member, .directory-item, article.member, .wpbdp-listing",
-    "name": "h3, h2, .member-name, .listing-title",
-    "website": 'a[href^="http"]:not([href*="jmea.org"])',
-    "email": 'a[href^="mailto:"]',
-    "phone": 'a[href^="tel:"]',
-    "address": ".member-address, .address",
-    "industry": ".member-category, .category",
-    "next_page": 'a.next, a[rel="next"]',
+    "card": ".listingdata-col",
+    "name": "a.title",
+    "category": ".address",          # misnamed upstream — holds industry label
+    "detail_link": "a.title",
+    "pagination_last": ".pagination a.page-numbers",
+    "detail_fields": "ul.ul-disc li",
+    "detail_website": ".listing-overview a[href^='http']",
 }
+
+_PHONE_PREFIX_RE = re.compile(r"^\s*(phone|tel|telephone|mobile)\s*[:\-]\s*", re.I)
+_EMAIL_PREFIX_RE = re.compile(r"^\s*(email|e-mail)\s*[:\-]\s*", re.I)
+_WEB_PREFIX_RE = re.compile(r"^\s*(website|web)\s*[:\-]\s*", re.I)
+_ADDR_PREFIX_RE = re.compile(r"^\s*(address|location)\s*[:\-]\s*", re.I)
 
 
 class JmeaScraper(CompanyScraper):
@@ -32,33 +45,87 @@ class JmeaScraper(CompanyScraper):
     country = "Jamaica"
 
     def fetch(self) -> Iterable[Company]:
-        url = LISTING_URL
-        seen_urls: set[str] = set()
-        while url and url not in seen_urls:
-            seen_urls.add(url)
-            soup = self.soup(url)
-            for card in soup.select(SELECTORS["card"]):
+        total_pages = self._discover_page_count()
+        logger.info("JMEA pages to scrape: %d", total_pages)
+        for page in range(1, total_pages + 1):
+            url = LISTING_URL if page == 1 else PAGE_URL.format(page=page)
+            try:
+                soup = self.soup(url)
+            except requests.HTTPError as e:
+                logger.warning("JMEA page %d failed: %s", page, e)
+                continue
+            cards = soup.select(SELECTORS["card"])
+            logger.info("JMEA page %d: %d cards", page, len(cards))
+            for card in cards:
                 name_el = card.select_one(SELECTORS["name"])
                 if not name_el:
                     continue
                 name = name_el.get_text(strip=True)
                 if not name:
                     continue
-                website_el = card.select_one(SELECTORS["website"])
-                email_el = card.select_one(SELECTORS["email"])
-                phone_el = card.select_one(SELECTORS["phone"])
-                addr_el = card.select_one(SELECTORS["address"])
-                industry_el = card.select_one(SELECTORS["industry"])
+                detail_url = name_el.get("href") or ""
+                cat_el = card.select_one(SELECTORS["category"])
+                industry = cat_el.get_text(" ", strip=True) if cat_el else None
+
+                phone = email = website = address = None
+                products = None
+                if detail_url:
+                    phone, email, website, address, products = self._fetch_detail(detail_url)
+
                 yield Company(
                     name=name,
                     country=self.country,
                     source=self.source_name,
-                    website=clean_website(website_el.get("href") if website_el else None),
-                    email=clean_email(email_el.get("href", "").replace("mailto:", "")) if email_el else None,
-                    phone=clean_phone(phone_el.get("href", "").replace("tel:", "")) if phone_el else None,
-                    address=addr_el.get_text(" ", strip=True) if addr_el else None,
-                    industry=industry_el.get_text(strip=True) if industry_el else None,
-                    source_url=url,
+                    website=website,
+                    email=email,
+                    phone=phone,
+                    address=address,
+                    industry=industry,
+                    products_services=products,
+                    source_url=detail_url or url,
                 )
-            next_el = soup.select_one(SELECTORS["next_page"])
-            url = next_el.get("href") if next_el else None
+
+    def _discover_page_count(self) -> int:
+        try:
+            soup = self.soup(LISTING_URL)
+        except requests.HTTPError as e:
+            logger.warning("JMEA root listing failed: %s", e)
+            return 1
+        pages = []
+        for a in soup.select(SELECTORS["pagination_last"]):
+            txt = a.get_text(strip=True)
+            if txt.isdigit():
+                pages.append(int(txt))
+        return min(max(pages) if pages else 1, MAX_PAGES)
+
+    def _fetch_detail(self, url: str):
+        try:
+            soup = self.soup(url)
+        except requests.HTTPError as e:
+            logger.debug("JMEA detail %s failed: %s", url, e)
+            return None, None, None, None, None
+        phone = email = website = address = products = None
+        for li in soup.select(SELECTORS["detail_fields"]):
+            txt = li.get_text(" ", strip=True)
+            if not txt:
+                continue
+            if _PHONE_PREFIX_RE.match(txt):
+                a = li.select_one('a[href^="tel:"]')
+                raw = a.get("href", "").replace("tel:", "") if a else _PHONE_PREFIX_RE.sub("", txt)
+                phone = clean_phone(raw) or phone
+            elif _EMAIL_PREFIX_RE.match(txt):
+                a = li.select_one('a[href^="mailto:"]')
+                raw = a.get("href", "").replace("mailto:", "") if a else _EMAIL_PREFIX_RE.sub("", txt)
+                email = clean_email(raw) or email
+            elif _WEB_PREFIX_RE.match(txt):
+                a = li.select_one('a[href^="http"]')
+                raw = a.get("href") if a else _WEB_PREFIX_RE.sub("", txt)
+                website = clean_website(raw) or website
+            elif _ADDR_PREFIX_RE.match(txt):
+                address = _ADDR_PREFIX_RE.sub("", txt) or address
+        overview = soup.select_one(".listing-overview")
+        if overview:
+            desc = overview.select_one("p")
+            if desc:
+                products = desc.get_text(" ", strip=True) or None
+        return phone, email, website, address, products

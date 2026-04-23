@@ -31,7 +31,9 @@ def normalize_company_name(raw: str) -> str:
 def clean_phone(raw: str | None) -> str | None:
     if not raw:
         return None
-    cleaned = re.sub(r"[^\d+]", "", raw)
+    # Keep only the first phone if multiple are provided (separated by /, ;, comma, or "or").
+    first = re.split(r"[;,/]| or ", raw, maxsplit=1)[0]
+    cleaned = re.sub(r"[^\d+]", "", first)
     if len(cleaned) < 7:
         return None
     return cleaned
