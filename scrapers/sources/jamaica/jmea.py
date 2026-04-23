@@ -43,6 +43,7 @@ class JmeaScraper(CompanyScraper):
     source_name = "JMEA"
     source_url = LISTING_URL
     country = "Jamaica"
+    delay_seconds = 1.5  # site has ~600 detail pages; 3s each would blow the 3h CI timeout
 
     def fetch(self) -> Iterable[Company]:
         total_pages = self._discover_page_count()
@@ -51,8 +52,8 @@ class JmeaScraper(CompanyScraper):
             url = LISTING_URL if page == 1 else PAGE_URL.format(page=page)
             try:
                 soup = self.soup(url)
-            except requests.HTTPError as e:
-                logger.warning("JMEA page %d failed: %s", page, e)
+            except requests.RequestException as e:
+                logger.warning("JMEA page %d failed (%s) — skipping page", page, e)
                 continue
             cards = soup.select(SELECTORS["card"])
             logger.info("JMEA page %d: %d cards", page, len(cards))
@@ -88,8 +89,8 @@ class JmeaScraper(CompanyScraper):
     def _discover_page_count(self) -> int:
         try:
             soup = self.soup(LISTING_URL)
-        except requests.HTTPError as e:
-            logger.warning("JMEA root listing failed: %s", e)
+        except requests.RequestException as e:
+            logger.warning("JMEA root listing failed (%s) — assuming 1 page", e)
             return 1
         pages = []
         for a in soup.select(SELECTORS["pagination_last"]):
@@ -101,8 +102,8 @@ class JmeaScraper(CompanyScraper):
     def _fetch_detail(self, url: str):
         try:
             soup = self.soup(url)
-        except requests.HTTPError as e:
-            logger.debug("JMEA detail %s failed: %s", url, e)
+        except requests.RequestException as e:
+            logger.debug("JMEA detail %s failed (%s)", url, e)
             return None, None, None, None, None
         phone = email = website = address = products = None
         for li in soup.select(SELECTORS["detail_fields"]):
